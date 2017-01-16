@@ -9,6 +9,7 @@ class WatcherProcess extends Process {
     private $logger;
     private $console;
     private $workerCount;
+    private $cpuCores;
     private $ipcServerUri;
     private $workerCommand;
     private $processes;
@@ -28,7 +29,7 @@ class WatcherProcess extends Process {
     }
 
     private function collectProcessGarbage() {
-        foreach ($this->processes as $key => $procHandle) {
+        foreach ($this->processes as $key => list($workerId, $procHandle)) {
             $info = proc_get_status($procHandle);
             if ($info["running"]) {
                 continue;
@@ -41,7 +42,7 @@ class WatcherProcess extends Process {
                 continue;
             }
             if (!$this->stopPromisor) {
-                $this->spawn();
+                $this->spawn($workerId);
             }
         }
 
@@ -75,7 +76,7 @@ class WatcherProcess extends Process {
 
         $promises = [];
         for ($i = 0; $i < $this->workerCount; $i++) {
-            $promises[] = $this->spawn();
+            $promises[] = $this->spawn($i);
         }
         yield \Amp\any($promises);
     }
@@ -221,9 +222,9 @@ class WatcherProcess extends Process {
             return 1;
         }
 
-        $cpuCores = $this->countCpuCores();
+        $this->cpuCores = $this->countCpuCores();
         if (!$console->isArgDefined("workers")) {
-            return $cpuCores;
+            return $this->cpuCores;
         }
 
         $workers = $console->getArg("workers");
@@ -231,14 +232,14 @@ class WatcherProcess extends Process {
             $this->logger->warning(
                 "Invalid worker count specified; integer >= 0 expected. Using CPU core count ..."
             );
-            return $cpuCores;
+            return $this->cpuCores;
         }
 
-        if ($workers > $cpuCores) {
-            $s = ($cpuCores === 1) ? "" : "s";
+        if ($workers > $this->cpuCores) {
+            $s = ($this->cpuCores === 1) ? "" : "s";
             $this->logger->warning(
                 "Running aerys with more worker processes than available CPU cores is not " .
-                "recommended. Aerys counted {$cpuCores} core{$s}, but you specified {$workers} " .
+                "recommended. Aerys counted {$this->cpuCores} core{$s}, but you specified {$workers} " .
                 "workers. If you know what you're doing you may safely ignore this message, " .
                 "but it's usually best to let the server determine the worker count."
             );
@@ -419,8 +420,9 @@ class WatcherProcess extends Process {
         return implode(" ", array_map("escapeshellarg", $parts));
     }
 
-    private function spawn() {
-        $cmd = $this->workerCommand;
+    private function spawn(int $workerId) {
+        $affinity = $this->cpuCores === $this->workerCount ? " --affinity " . $workerId : "";
+        $cmd = $this->workerCommand . $affinity;
         $fds = [["pipe", "r"], ["pipe", "w"], ["pipe", "w"]];
         $options = ["bypass_shell" => true];
         if (!$procHandle = \proc_open($cmd, $fds, $pipes, null, null, $options)) {
@@ -431,7 +433,7 @@ class WatcherProcess extends Process {
         foreach ($pipes as $pipe) {
             @fclose($pipe);
         }
-        $this->processes[] = $procHandle;
+        $this->processes[] = [$workerId, $procHandle];
 
         return ($this->spawnPromisors[] = new Deferred)->promise();
     }
@@ -439,7 +441,7 @@ class WatcherProcess extends Process {
     public function restart() {
         $spawn = count($this->ipcClients);
         for ($i = 0; $i < $spawn; $i++) {
-            $this->spawn()->when(function() {
+            $this->spawn($i)->when(function() {
                 @\fwrite(current($this->ipcClients), "\n");
                 next($this->ipcClients);
             });

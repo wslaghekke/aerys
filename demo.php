@@ -10,6 +10,7 @@ use Aerys\{ Host, Request, Response, Router, Websocket, function root, function 
 
 const AERYS_OPTIONS = [
     "keepAliveTimeout" => 60,
+    "connectionsPerIP" => PHP_INT_MAX,
     //"deflateMinimumLength" => 0,
 ];
 
