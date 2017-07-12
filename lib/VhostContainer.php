@@ -3,12 +3,25 @@
 namespace Aerys;
 
 class VhostContainer implements \Countable, Monitor {
+    /** @var \Aerys\Vhost[] */
     private $vhosts = [];
+
+    /** @var int */
     private $cachedVhostCount = 0;
+
+    /** @var \Aerys\Vhost */
     private $defaultHost;
+
+    /** @var \Aerys\HttpDriver[] */
     private $httpDrivers = [];
+
+    /** @var \Aerys\HttpDriver */
     private $defaultHttpDriver;
+
+    /** @var bool[] */
     private $setupHttpDrivers = [];
+
+    /** @var callable[] */
     private $setupArgs;
 
     public function __construct(HttpDriver $driver) {

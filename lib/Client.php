@@ -10,8 +10,18 @@ class Client {
     const CLOSED_RDWR = 3;
 
     use Struct;
+
+    /** @var string */
     public $id;
+
+    /** @var \Amp\Socket\ServerSocket */
     public $socket;
+
+    /** @var callable */
+    public $sink;
+
+    public $closer;
+
     public $clientAddr;
     public $clientPort;
     public $serverAddr;
@@ -19,16 +29,12 @@ class Client {
     public $isEncrypted;
     public $cryptoInfo;
     public $requestParser;
-    public $readWatcher;
-    public $writeWatcher;
 
-    public $writeBuffer = "";
     public $bufferSize = 0;
 
     /** @var \Amp\Deferred */
     public $bufferDeferred;
 
-    public $onWriteDrain;
     public $shouldClose;
     public $isDead = 0;
     public $isExported;
@@ -54,4 +60,12 @@ class Client {
     public $streamEnd = [];
     public $streamWindow = [];
     public $streamWindowBuffer = [];
+
+    public function close() {
+        $this->socket->close();
+
+        if ($this->closer) {
+            ($this->closer)($this->id);
+        }
+    }
 }

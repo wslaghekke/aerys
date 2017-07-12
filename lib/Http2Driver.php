@@ -375,12 +375,11 @@ class Http2Driver implements HttpDriver {
 assert(!\defined("Aerys\\DEBUG_HTTP2") || print "OUT: ");
 assert(!\defined("Aerys\\DEBUG_HTTP2") || var_dump(bin2hex(substr(pack("N", \strlen($data)), 1, 3) . $type . $flags . pack("N", $stream) . $data)) || 1);
         $new = substr(pack("N", \strlen($data)), 1, 3) . $type . $flags . pack("N", $stream) . $data;
-        $client->writeBuffer .= $new;
         $client->bufferSize += \strlen($new);
         if ($client->bufferSize > $client->options->softStreamCap) {
             $client->bufferDeferred = new Deferred;
         }
-        ($this->write)($client, $type == self::DATA && ($flags & self::END_STREAM) != "\0");
+        ($this->write)($client, $new, $type == self::DATA && ($flags & self::END_STREAM) != "\0");
     }
 
     public function upgradeBodySize(InternalRequest $ireq) {

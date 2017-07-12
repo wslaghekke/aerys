@@ -11,9 +11,11 @@ use Amp\Emitter;
 use Amp\Failure;
 use Amp\Loop;
 use Amp\Promise;
+use Amp\Socket\ServerSocket;
 use Amp\Success;
 use Psr\Log\LoggerInterface as PsrLogger;
 use function Amp\call;
+use function Amp\coroutine;
 use function Amp\Promise\all;
 use function Amp\Promise\any;
 use function Amp\Promise\timeout;
@@ -34,6 +36,9 @@ class Server implements Monitor {
 
     /** @var int */
     private $state = self::STOPPED;
+
+    /** @var int Next client ID. */
+    private $nextId = 1;
 
     /** @var \Aerys\Options */
     private $options;
@@ -81,9 +86,6 @@ class Server implements Monitor {
     private $exporter;
     private $onAcceptable;
     private $negotiateCrypto;
-    private $onReadable;
-    private $onWritable;
-    private $onResponseDataDone;
     private $sendPreAppServiceUnavailableResponse;
     private $sendPreAppMethodNotAllowedResponse;
     private $sendPreAppInvalidHostResponse;
@@ -104,9 +106,6 @@ class Server implements Monitor {
         $this->exporter = $this->callableFromInstanceMethod("export");
         $this->onAcceptable = $this->callableFromInstanceMethod("onAcceptable");
         $this->negotiateCrypto = $this->callableFromInstanceMethod("negotiateCrypto");
-        $this->onReadable = $this->callableFromInstanceMethod("onReadable");
-        $this->onWritable = $this->callableFromInstanceMethod("onWritable");
-        $this->onResponseDataDone = $this->callableFromInstanceMethod("onResponseDataDone");
         $this->sendPreAppServiceUnavailableResponse = $this->callableFromInstanceMethod("sendPreAppServiceUnavailableResponse");
         $this->sendPreAppMethodNotAllowedResponse = $this->callableFromInstanceMethod("sendPreAppMethodNotAllowedResponse");
         $this->sendPreAppInvalidHostResponse = $this->callableFromInstanceMethod("sendPreAppInvalidHostResponse");
@@ -243,7 +242,7 @@ class Server implements Monitor {
     private function doStart(callable $bindSockets): \Generator {
         assert($this->logDebug("starting"));
 
-        $this->vhosts->setupHttpDrivers($this->createHttpDriverHandlers(), $this->callableFromInstanceMethod("writeResponse"));
+        $this->vhosts->setupHttpDrivers($this->createHttpDriverHandlers(), coroutine($this->callableFromInstanceMethod("writeResponse")));
 
         $this->boundServers = yield $bindSockets($this->generateBindableAddressContextMap());
 
@@ -325,15 +324,28 @@ class Server implements Monitor {
 
         \assert($this->logDebug("accept {$peerName}"));
 
-        \stream_set_blocking($client, false);
+        $socket = new ServerSocket($client, $this->options->ioGranularity);
+
         $contextOptions = \stream_context_get_options($client);
+
         if (isset($contextOptions["ssl"])) {
-            $clientId = (int) $client;
-            $watcherId = Loop::onReadable($client, $this->negotiateCrypto, [$ip, $port]);
-            $this->pendingTlsStreams[$clientId] = [$watcherId, $client];
-        } else {
-            $this->importClient($client, $ip, $port);
+            $socket->enableCrypto()->onResolve(function ($exception) use ($socket, $ip, $port) {
+                if ($exception) {
+                    $this->clientCount--;
+                    $net = @\inet_pton($ip);
+                    if (isset($net[4])) {
+                        $net = substr($net, 0, 7 /* /56 block */);
+                    }
+                    $this->clientsPerIP[$net]--;
+                    $socket->close();
+                    return;
+                }
+
+                $this->importClient($socket, $ip, $port);
+            });
         }
+
+        $this->importClient($socket, $ip, $port);
     }
 
     private function negotiateCrypto(string $watcherId, $socket, $peer) {
@@ -424,9 +436,9 @@ class Server implements Monitor {
         yield $this->notify();
     }
 
-    private function importClient($socket, $ip, $port) {
+    private function importClient(ServerSocket $socket, $ip, $port) {
         $client = new Client;
-        $client->id = (int) $socket;
+        $client->id = $this->nextId++;
         $client->socket = $socket;
         $client->options = $this->options;
         $client->exporter = $this->exporter;
@@ -435,76 +447,81 @@ class Server implements Monitor {
         $client->clientAddr = $ip;
         $client->clientPort = $port;
 
-        $serverName = stream_socket_get_name($socket, false);
+        $serverName = $socket->getLocalAddress();
         $portStartPos = strrpos($serverName, ":");
         $client->serverAddr = substr($serverName, 0, $portStartPos);
         $client->serverPort = substr($serverName, $portStartPos + 1);
 
-        $meta = stream_get_meta_data($socket);
+        $meta = stream_get_meta_data($socket->getResource());
         $client->cryptoInfo = $meta["crypto"] ?? [];
         $client->isEncrypted = (bool) $client->cryptoInfo;
-
-        $client->readWatcher = Loop::onReadable($socket, $this->onReadable, $client);
-        $client->writeWatcher = Loop::onWritable($socket, $this->onWritable, $client);
-        Loop::disable($client->writeWatcher);
 
         $this->clients[$client->id] = $client;
 
         $client->httpDriver = $this->vhosts->selectHttpDriver($client->serverAddr, $client->serverPort);
         $client->requestParser = $client->httpDriver->parser($client);
-        $client->requestParser->valid();
+        $client->sink = [$client->requestParser, "send"];
+        //$client->requestParser->valid();
 
         $this->renewKeepAliveTimeout($client);
+
+        Promise\rethrow(new Coroutine($this->read($client)));
     }
 
-    private function writeResponse(Client $client, bool $final = false) {
-        $this->onWritable($client->writeWatcher, $client->socket, $client);
-
-        if (empty($final)) {
-            return;
-        }
-
-        if ($client->writeBuffer == "") {
-            $this->onResponseDataDone($client);
-        } else {
-            $client->onWriteDrain = $this->onResponseDataDone;
-        }
-    }
-
-    private function onResponseDataDone(Client $client) {
-        if ($client->shouldClose || (--$client->pendingResponses == 0 && $client->isDead == Client::CLOSED_RD)) {
-            $this->close($client);
-        } elseif (!($client->isDead & Client::CLOSED_RD)) {
+    private function read(Client $client): \Generator {
+        while (($chunk = yield $client->socket->read()) !== null) {
             $this->renewKeepAliveTimeout($client);
+            $result = ($client->sink)($chunk);
+
+            if ($result instanceof Promise) {
+                try {
+                    yield $result;
+                } catch (\Throwable $exception) {
+                    break; // Fall through to unloading the client below.
+                }
+            }
+        }
+
+        if ($client->isDead === Client::CLOSED_WR || $client->pendingResponses === 0) {
+            $this->close($client);
+        } else {
+            $client->isDead = Client::CLOSED_RD;
+            if ($client->bodyEmitters) {
+                $ex = new ClientException;
+                foreach ($client->bodyEmitters as $key => $emitter) {
+                    $emitter->fail($ex);
+                    $client->bodyEmitters[$key] = new Emitter;
+                }
+            }
         }
     }
 
-    private function onWritable(string $watcherId, $socket, Client $client) {
-        $bytesWritten = @\fwrite($socket, $client->writeBuffer);
-        if ($bytesWritten === false || ($bytesWritten === 0 && (!\is_resource($socket) || @\feof($socket)))) {
-            if ($client->isDead == Client::CLOSED_RD) {
-                $this->close($client);
-            } else {
-                $client->isDead = Client::CLOSED_WR;
-                Loop::cancel($watcherId);
-            }
-        } else {
-            $client->bufferSize -= $bytesWritten;
-            if ($bytesWritten === \strlen($client->writeBuffer)) {
-                $client->writeBuffer = "";
-                Loop::disable($watcherId);
-                if ($client->onWriteDrain) {
-                    ($client->onWriteDrain)($client);
-                }
-            } else {
-                $client->writeBuffer = \substr($client->writeBuffer, $bytesWritten);
-                Loop::enable($watcherId);
-            }
+    private function writeResponse(Client $client, string $data, bool $final = false): \Generator {
+        try {
+            $bytes = yield $client->socket->write($data);
+            $client->bufferSize -= $bytes;
+
             if ($client->bufferDeferred && $client->bufferSize <= $client->options->softStreamCap) {
                 $deferred = $client->bufferDeferred;
                 $client->bufferDeferred = null;
                 $deferred->resolve();
             }
+        } catch (\Throwable $exception) {
+            if ($client->isDead === Client::CLOSED_RD) {
+                $this->close($client);
+            } else {
+                $client->isDead = Client::CLOSED_WR;
+            }
+            return;
+        }
+
+        if ($client->shouldClose || (--$client->pendingResponses === 0 && $client->isDead == Client::CLOSED_RD)) {
+            $this->close($client);
+            return;
+        }
+
+        if (!($client->isDead & Client::CLOSED_RD)) {
+            $this->renewKeepAliveTimeout($client);
         }
     }
 
@@ -541,31 +558,6 @@ class Server implements Monitor {
 
     private function clearKeepAliveTimeout(Client $client) {
         unset($this->keepAliveTimeouts[$client->id]);
-    }
-
-    private function onReadable(string $watcherId, $socket, Client $client) {
-        $data = @\fread($socket, $this->options->ioGranularity);
-        if ($data == "") {
-            if (!\is_resource($socket) || @\feof($socket)) {
-                if ($client->isDead == Client::CLOSED_WR || $client->pendingResponses == 0) {
-                    $this->close($client);
-                } else {
-                    $client->isDead = Client::CLOSED_RD;
-                    Loop::cancel($watcherId);
-                    if ($client->bodyEmitters) {
-                        $ex = new ClientException;
-                        foreach ($client->bodyEmitters as $key => $emitter) {
-                            $emitter->fail($ex);
-                            $client->bodyEmitters[$key] = new Emitter;
-                        }
-                    }
-                }
-            }
-            return;
-        }
-
-        $this->renewKeepAliveTimeout($client);
-        $client->requestParser->send($data);
     }
 
     private function onParsedMessageWithoutEntity(Client $client, array $parseResult) {
@@ -873,8 +865,11 @@ class Server implements Monitor {
 
     private function close(Client $client) {
         $this->clear($client);
-        assert($client->isDead != Client::CLOSED_RDWR);
-        @fclose($client->socket);
+
+        assert($client->isDead !== Client::CLOSED_RDWR);
+        $client->close();
+
+        //@fclose($client->socket);
         $client->isDead = Client::CLOSED_RDWR;
 
         $this->clientCount--;
@@ -899,45 +894,27 @@ class Server implements Monitor {
 
     private function clear(Client $client) {
         $client->requestParser = null; // break cyclic reference
-        $client->onWriteDrain = null;
-        Loop::cancel($client->readWatcher);
-        Loop::cancel($client->writeWatcher);
+        $client->sink = null;
+
         $this->clearKeepAliveTimeout($client);
+
         unset($this->clients[$client->id]);
+
         if ($this->stopDeferred && empty($this->clients)) {
             $this->stopDeferred->resolve();
         }
     }
 
-    private function export(Client $client): \Closure {
-        $client->isDead = Client::CLOSED_RDWR;
-        $client->isExported = true;
+    private function export(Client $client, callable $sink, callable $closer) {
         $this->clear($client);
 
-        assert($this->logDebug("export {$client->clientAddr}:{$client->clientPort}"));
+        //$client->isDead = Client::CLOSED_RDWR;
+        $client->isExported = true;
 
-        $net = @\inet_pton($client->clientAddr);
-        if (isset($net[4])) {
-            $net = substr($net, 0, 7 /* /56 block */);
-        }
-        $clientCount = &$this->clientCount;
-        $clientsPerIP = &$this->clientsPerIP[$net];
-        $closer = static function () use (&$clientCount, &$clientsPerIP) {
-            $clientCount--;
-            $clientsPerIP--;
-        };
-        assert($closer = (function () use ($client, &$clientCount, &$clientsPerIP) {
-            $logger = $this->logger;
-            $message = "close {$client->clientAddr}:{$client->clientPort}";
-            return static function () use (&$clientCount, &$clientsPerIP, $logger, $message) {
-                $clientCount--;
-                $clientsPerIP--;
-                assert($clientCount >= 0);
-                assert($clientsPerIP >= 0);
-                $logger->log(Logger::DEBUG, $message);
-            };
-        })());
-        return $closer;
+        $client->sink = $sink;
+        $client->closer = $closer;
+
+        assert($this->logDebug("export {$client->clientAddr}:{$client->clientPort}"));
     }
 
     private function dropPrivileges() {

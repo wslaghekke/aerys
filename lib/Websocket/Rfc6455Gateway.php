@@ -12,6 +12,7 @@ use Aerys\Response;
 use Aerys\Server;
 use Aerys\ServerObserver;
 use Aerys\Websocket;
+use Amp\ByteStream\StreamException;
 use Amp\CallableMaker;
 use Amp\Coroutine;
 use Amp\Deferred;
@@ -27,6 +28,9 @@ use function Amp\call;
 
 class Rfc6455Gateway implements Middleware, Monitor, ServerObserver {
     use CallableMaker;
+
+    /** @var int Next client ID. */
+    private $nextId = 1;
 
     /** @var \Psr\Log\LoggerInterface */
     private $logger;
@@ -74,8 +78,6 @@ class Rfc6455Gateway implements Middleware, Monitor, ServerObserver {
 
     // private callables that we pass to external code //
     private $reapClient;
-    private $onReadable;
-    private $onWritable;
 
     /* Frame control bits */
     const FIN      = 0b1;
@@ -94,8 +96,6 @@ class Rfc6455Gateway implements Middleware, Monitor, ServerObserver {
         $this->endpoint = new Rfc6455Endpoint($this);
 
         $this->reapClient = $this->callableFromInstanceMethod("reapClient");
-        $this->onReadable = $this->callableFromInstanceMethod("onReadable");
-        $this->onWritable = $this->callableFromInstanceMethod("onWritable");
     }
 
     public function setOption(string $option, $value) {
@@ -203,7 +203,7 @@ class Rfc6455Gateway implements Middleware, Monitor, ServerObserver {
         $handshaker->end();
     }
 
-    public function do(InternalRequest $ireq) {
+    public function do(InternalRequest $ireq): \Generator {
         $headers = yield;
         if ($headers[":status"] === 101) {
             $yield = yield $headers;
@@ -222,11 +222,8 @@ class Rfc6455Gateway implements Middleware, Monitor, ServerObserver {
         $client = new Rfc6455Client;
         $client->capacity = $this->maxBytesPerMinute;
         $client->connectedAt = $this->now;
-        $socket = $ireq->client->socket;
-        $client->id = (int) $socket;
-        $client->socket = $socket;
-        $client->writeBuffer = $ireq->client->writeBuffer;
-        $client->serverRefClearer = ($ireq->client->exporter)($ireq->client);
+        $client->id = $this->nextId++;
+        $client->socket = $ireq->client->socket;
 
         $client->parser = self::parser($this, $client, $options = [
             "max_msg_size" => $this->maxMsgSize,
@@ -235,14 +232,43 @@ class Rfc6455Gateway implements Middleware, Monitor, ServerObserver {
             "text_only" => $this->textOnly,
             "threshold" => $this->autoFrameSize,
         ]);
-        $client->readWatcher = Loop::onReadable($socket, $this->onReadable, $client);
-        $client->writeWatcher = Loop::onWritable($socket, $this->onWritable, $client);
-        if ($client->writeBuffer !== "") {
-            $client->writeDeferred = new Deferred; // dummy to prevent error
-            $client->framesSent = -1;
-        } else {
-            Loop::disable($client->writeWatcher);
-        }
+
+        $sink = function (string $chunk) use ($client) /*: ?Promise */ {
+            $client->lastReadAt = $this->now;
+            $client->bytesRead += \strlen($chunk);
+            $client->capacity -= \strlen($chunk);
+
+            $frames = $client->parser->send($chunk);
+            $client->framesRead += $frames;
+            $client->framesLastSecond += $frames;
+
+            if ($client->capacity < $this->maxBytesPerMinute / 2) {
+                $client->rateDeferred = new Deferred;
+                $this->lowCapacityClients[$client->id] = $client;
+                return $client->rateDeferred->promise();
+            }
+
+            if ($client->framesLastSecond > $this->maxFramesPerSecond / 2) {
+                $client->rateDeferred = new Deferred;
+                $this->highFramesPerSecondClients[$client->id] = $client;
+                return $client->rateDeferred->promise();
+            }
+        };
+
+        $close = function () use ($client) {
+            if (!$client->closedAt) {
+                $client->closedAt = $this->now;
+                $code = Code::ABNORMAL_CLOSE;
+                $reason = "Client closed underlying TCP connection";
+                Promise\rethrow(new Coroutine($this->tryAppOnClose($client->id, $code, $reason)));
+            } else {
+                unset($this->closeTimeouts[$client->id]);
+            }
+
+            $this->unloadClient($client);
+        };
+
+        ($ireq->client->exporter)($ireq->client, $sink, $close);
 
         $this->clients[$client->id] = $client;
         $this->heartbeatTimeouts[$client->id] = $this->now + $this->heartbeatPeriod;
@@ -284,11 +310,14 @@ class Rfc6455Gateway implements Middleware, Monitor, ServerObserver {
             $this->closeTimeouts[$client->id] = $this->now + $this->closePeriod;
             $promise = $this->sendCloseFrame($client, $code, $reason);
             yield from $this->tryAppOnClose($client->id, $code, $reason);
-            return yield $promise;
+            yield $promise;
         } catch (ClientException $e) {
             // Ignore client failures.
+        } catch (StreamException $e) {
+            // Ignore stream failures.
         }
-        // Don't unload the client here, it will be unloaded upon timeout or last data written if closed by client or OP_CLOSE received by client
+
+        $client->socket->close();
     }
 
     private function sendCloseFrame(Rfc6455Client $client, int $code, string $msg): Promise {
@@ -308,15 +337,9 @@ class Rfc6455Gateway implements Middleware, Monitor, ServerObserver {
 
     private function unloadClient(Rfc6455Client $client) {
         $client->parser = null;
-        if ($client->readWatcher) {
-            Loop::cancel($client->readWatcher);
-        }
-        if ($client->writeWatcher) {
-            Loop::cancel($client->writeWatcher);
-        }
 
         unset($this->heartbeatTimeouts[$client->id]);
-        ($client->serverRefClearer)();
+
         unset($this->clients[$client->id]);
 
         // fail not yet terminated message streams; they *must not* be failed before client is removed
@@ -324,19 +347,14 @@ class Rfc6455Gateway implements Middleware, Monitor, ServerObserver {
             $client->msgEmitter->fail(new ClientException);
         }
 
-        if ($client->writeBuffer != "") {
-            $client->writeDeferred->fail(new ClientException);
-        }
-        foreach ([$client->writeDeferredDataQueue, $client->writeDeferredControlQueue] as $deferreds) {
-            foreach ($deferreds as $deferred) {
-                $deferred->fail(new ClientException);
-            }
-        }
+        $this->logger->debug("Client $client->id closed");
+
+        $client->socket->close();
     }
 
     private function onParsedControlFrame(Rfc6455Client $client, int $opcode, string $data) {
-        // something went that wrong that we had to shutdown our readWatcher... if parser has anything left, we don't care!
-        if (!$client->readWatcher) {
+        // something went that wrong that we had to close... if parser has anything left, we don't care!
+        if ($client->closedAt) {
             return;
         }
 
@@ -354,9 +372,6 @@ class Rfc6455Gateway implements Middleware, Monitor, ServerObserver {
                         $reason = substr($data, 2);
                     }
 
-                    @stream_socket_shutdown($client->socket, STREAM_SHUT_RD);
-                    Loop::cancel($client->readWatcher);
-                    $client->readWatcher = null;
                     Promise\rethrow(new Coroutine($this->doClose($client, $code, $reason)));
                 }
                 break;
@@ -404,124 +419,16 @@ class Rfc6455Gateway implements Middleware, Monitor, ServerObserver {
 
     public function onParsedError(Rfc6455Client $client, int $code, string $msg) {
         // something went that wrong that we had to shutdown our readWatcher... if parser has anything left, we don't care!
-        if (!$client->readWatcher) {
+        if ($client->closedAt) {
             return;
         }
 
         if ($code) {
-            if ($client->closedAt || $code === Code::PROTOCOL_ERROR) {
-                @stream_socket_shutdown($client->socket, STREAM_SHUT_RD);
-                Loop::cancel($client->readWatcher);
-                $client->readWatcher = null;
-            }
-
-            if (!$client->closedAt) {
-                Promise\rethrow(new Coroutine($this->doClose($client, $code, $msg)));
-            }
+            Promise\rethrow(new Coroutine($this->doClose($client, $code, $msg)));
         }
     }
 
-    private function onReadable($watcherId, $socket, Rfc6455Client $client) {
-        $data = @fread($socket, 8192);
 
-        if ($data !== "") {
-            $client->lastReadAt = $this->now;
-            $client->bytesRead += \strlen($data);
-            $client->capacity -= \strlen($data);
-            if ($client->capacity < $this->maxBytesPerMinute / 2) {
-                $this->lowCapacityClients[$client->id] = $client;
-                if ($client->capacity <= 0) {
-                    Loop::disable($watcherId);
-                }
-            }
-            $frames = $client->parser->send($data);
-            $client->framesRead += $frames;
-            $client->framesLastSecond += $frames;
-            if ($client->framesLastSecond > $this->maxFramesPerSecond / 2) {
-                if ($client->framesLastSecond > $this->maxFramesPerSecond * 1.5) {
-                    Loop::disable($watcherId); // aka tiny frame DoS prevention
-                }
-                $this->highFramesPerSecondClients[$client->id] = $client;
-            }
-        } elseif (!is_resource($socket) || @feof($socket)) {
-            if (!$client->closedAt) {
-                $client->closedAt = $this->now;
-                $code = Code::ABNORMAL_CLOSE;
-                $reason = "Client closed underlying TCP connection";
-                Promise\rethrow(new Coroutine($this->tryAppOnClose($client->id, $code, $reason)));
-            } else {
-                unset($this->closeTimeouts[$client->id]);
-            }
-
-            $this->unloadClient($client);
-        }
-    }
-
-    private function onWritable($watcherId, $socket, Rfc6455Client $client) {
-        $bytes = @fwrite($socket, $client->writeBuffer);
-        $client->bytesSent += $bytes;
-
-        if ($bytes !== \strlen($client->writeBuffer)) {
-            $client->writeBuffer = substr($client->writeBuffer, $bytes);
-        } elseif ($bytes === 0 && $client->closedAt && (!is_resource($socket) || @feof($socket))) {
-            // usually read watcher cares about aborted TCP connections, but when
-            // $client->closedAt is true, it might be the case that read watcher
-            // is already cancelled and we need to ensure that our writing Promise
-            // is fulfilled in unloadClient() with a failure
-            unset($this->closeTimeouts[$client->id]);
-            $this->unloadClient($client);
-        } else {
-            $client->framesSent++;
-            $client->writeDeferred->resolve();
-            if ($client->writeControlQueue) {
-                $key = key($client->writeControlQueue);
-                $client->writeBuffer = $client->writeControlQueue[$key];
-                $client->lastSentAt = $this->now;
-                $client->writeDeferred = $client->writeDeferredControlQueue[$key];
-                unset($client->writeControlQueue[$key], $client->writeDeferredControlQueue[$key]);
-                while (\strlen($client->writeBuffer) < 65536 && $client->writeControlQueue) {
-                    $key = key($client->writeControlQueue);
-                    $client->writeBuffer .= $client->writeControlQueue[$key];
-                    $client->writeDeferredControlQueue[$key]->resolve($client->writeDeferred);
-                    unset($client->writeControlQueue[$key], $client->writeDeferredControlQueue[$key]);
-                }
-                while (\strlen($client->writeBuffer) < 65536 && $client->writeDataQueue) {
-                    $key = key($client->writeDataQueue);
-                    $client->writeBuffer .= $client->writeDataQueue[$key];
-                    $client->writeDeferredDataQueue[$key]->resolve($client->writeDeferred);
-                    unset($client->writeDataQueue[$key], $client->writeDeferredDataQueue[$key]);
-                }
-            } elseif ($client->closedAt) {
-                $client->writeBuffer = "";
-                $client->writeDeferred = null;
-                if ($client->readWatcher) { // readWatcher exists == we are still waiting for an OP_CLOSE frame
-                    @stream_socket_shutdown($socket, STREAM_SHUT_WR);
-                    Loop::cancel($watcherId);
-                    $client->writeWatcher = null;
-                } else {
-                    unset($this->closeTimeouts[$client->id]);
-                    $this->unloadClient($client);
-                }
-            } elseif ($client->writeDataQueue) {
-                $key = key($client->writeDataQueue);
-                $client->writeBuffer = $client->writeDataQueue[$key];
-                $client->lastDataSentAt = $this->now;
-                $client->lastSentAt = $this->now;
-                $client->writeDeferred = $client->writeDeferredDataQueue[$key];
-                unset($client->writeDataQueue[$key], $client->writeDeferredDataQueue[$key]);
-                while (\strlen($client->writeBuffer) < 65536 && $client->writeDataQueue) {
-                    $key = key($client->writeDataQueue);
-                    $client->writeBuffer .= $client->writeDataQueue[$key];
-                    $client->writeDeferredDataQueue[$key]->resolve($client->writeDeferred);
-                    unset($client->writeDataQueue[$key], $client->writeDeferredDataQueue[$key]);
-                }
-            } else {
-                $client->writeDeferred = null;
-                $client->writeBuffer = "";
-                Loop::disable($watcherId);
-            }
-        }
-    }
 
     private function compile(Rfc6455Client $client, string $msg, int $opcode, bool $fin): string {
         $rsv = 0b000; // @TODO Add filter mechanism based on $client (e.g. gzip)
@@ -547,24 +454,13 @@ class Rfc6455Gateway implements Middleware, Monitor, ServerObserver {
 
         $frame = $this->compile($client, $msg, $opcode, $fin);
 
-        if ($client->writeBuffer !== "") {
-            if (\strlen($client->writeBuffer) < 65536 && !$client->writeDataQueue && !$client->writeControlQueue) {
-                $client->writeBuffer .= $frame;
-                $deferred = $client->writeDeferred;
-            } elseif ($opcode >= 0x8) {
-                $client->writeControlQueue[] = $frame;
-                $deferred = $client->writeDeferredControlQueue[] = new Deferred;
-            } else {
-                $client->writeDataQueue[] = $frame;
-                $deferred = $client->writeDeferredDataQueue[] = new Deferred;
-            }
-        } else {
-            Loop::enable($client->writeWatcher);
-            $client->writeBuffer = $frame;
-            $deferred = $client->writeDeferred = new Deferred;
-        }
+        return call(function () use ($client, $frame) {
+            $bytes = yield $client->socket->write($frame);
 
-        return $deferred->promise();
+            $client->bytesSent += $bytes;
+            $client->framesSent++;
+            $client->lastSentAt = $this->now;
+        });
     }
 
     public function send(string $data, bool $binary, int $clientId): Promise {
@@ -740,7 +636,7 @@ class Rfc6455Gateway implements Middleware, Monitor, ServerObserver {
                 unset($this->lowCapacityClients[$id]);
             }
             if ($client->capacity > 8192 && !isset($this->highFramesPerSecondClients[$id]) && !$client->closedAt) {
-                Loop::enable($client->readWatcher);
+                $client->rateDeferred->resolve();
             }
         }
 
@@ -749,7 +645,7 @@ class Rfc6455Gateway implements Middleware, Monitor, ServerObserver {
             if ($client->framesLastSecond < $this->maxFramesPerSecond) {
                 unset($this->highFramesPerSecondClients[$id]);
                 if ($client->capacity > 8192 && !$client->closedAt) {
-                    Loop::enable($client->readWatcher);
+                    $client->rateDeferred->resolve();
                 }
             }
         }

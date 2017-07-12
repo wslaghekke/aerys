@@ -63,7 +63,7 @@ class Http1Driver implements HttpDriver {
             $client->httpDriver = $this->http2;
             $client->requestParser = $client->httpDriver->parser($client, $h2cSettings);
 
-            $client->requestParser->valid(); // start generator
+            //$client->requestParser->valid(); // start generator
 
             $ireq->responseWriter = $client->httpDriver->writer($ireq);
             $ireq->streamId = 1;
@@ -140,8 +140,7 @@ class Http1Driver implements HttpDriver {
             $msgs .= $msgPart;
 
             if ($msgPart === false || \strlen($msgs) >= $client->options->outputBufferSize) {
-                $client->writeBuffer .= $msgs;
-                ($this->responseWriter)($client);
+                ($this->responseWriter)($client, $msgs);
                 $msgs = "";
 
                 if ($client->isDead & Client::CLOSED_WR) {
@@ -161,14 +160,12 @@ class Http1Driver implements HttpDriver {
             }
         } while (($msgPart = yield) !== null);
 
-        $client->writeBuffer .= $msgs;
-
         // parserEmitLock check is required to prevent recursive continuation of the parser
         if ($client->requestParser && $client->parserEmitLock && !$client->shouldClose) {
             $client->requestParser->send(false);
         }
 
-        ($this->responseWriter)($client, $final = true);
+        ($this->responseWriter)($client, $msgs, $final = true);
 
         if ($client->isDead == Client::CLOSED_RD /* i.e. not CLOSED_WR */ && $client->bodyEmitters) {
             array_pop($client->bodyEmitters)->fail(new ClientException); // just one element with Http1Driver
