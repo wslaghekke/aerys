@@ -2,19 +2,26 @@
 
 namespace Aerys;
 
+use Amp\ByteStream\InMemoryStream;
+use Amp\ByteStream\InputStream;
+
 class StandardResponse implements Response {
-    private $codec;
-    private $client;
-    private $state = self::NONE;
     private $headers = [
         ":status" => 200,
         ":reason" => null,
     ];
     private $cookies = [];
+    private $body;
 
-    public function __construct(\Generator $codec, Client $client) {
-        $this->codec = $codec;
-        $this->client = $client;
+    public function __construct(array $headers = [], $body = null) {
+        $this->headers = $headers + [":status" => 200, ":reason" => null];
+        if ($body) {
+            if (\is_string($body)) {
+                $body = new InMemoryStream($body);
+            }
+            \assert($body instanceof InputStream);
+            $this->body = $body;
+        }
     }
 
     public function __debugInfo(): array {
@@ -22,16 +29,14 @@ class StandardResponse implements Response {
     }
 
     /**
-     * {@inheritDoc}
-     * @throws \Error If output already started
+     * Set the numeric HTTP status code.
+     *
+     * If not assigned this value defaults to 200.
+     *
+     * @param int $code An integer in the range [100-599]
      * @return self
      */
     public function setStatus(int $code): Response {
-        if ($this->state & self::STARTED) {
-            throw new \Error(
-                "Cannot set status code; output already started"
-            );
-        }
         assert(($code >= 100 && $code <= 599), "Invalid HTTP status code [100-599] expected");
         $this->headers[":status"] = $code;
 
@@ -39,16 +44,12 @@ class StandardResponse implements Response {
     }
 
     /**
-     * {@inheritDoc}
-     * @throws \Error If output already started
+     * Set the optional HTTP reason phrase.
+     *
+     * @param string $phrase A human readable string describing the status code
      * @return self
      */
     public function setReason(string $phrase): Response {
-        if ($this->state & self::STARTED) {
-            throw new \Error(
-                "Cannot set reason phrase; output already started"
-            );
-        }
         assert($this->isValidReasonPhrase($phrase), "Invalid reason phrase: {$phrase}");
         $this->headers[":reason"] = $phrase;
 
@@ -65,16 +66,13 @@ class StandardResponse implements Response {
     }
 
     /**
-     * {@inheritDoc}
-     * @throws \Error If output already started
+     * Append the specified header.
+     *
+     * @param string $field
+     * @param string $value
      * @return self
      */
     public function addHeader(string $field, string $value): Response {
-        if ($this->state & self::STARTED) {
-            throw new \Error(
-                "Cannot add header; output already started"
-            );
-        }
         assert($this->isValidHeaderField($field), "Invalid header field: {$field}");
         assert($this->isValidHeaderValue($value), "Invalid header value: {$value}");
         $this->headers[strtolower($field)][] = $value;
@@ -107,16 +105,15 @@ class StandardResponse implements Response {
     }
 
     /**
-     * {@inheritDoc}
-     * @throws \Error If output already started
+     * Set the specified header.
+     *
+     * This method will replace any existing headers for the specified field.
+     *
+     * @param string $field
+     * @param string $value
      * @return self
      */
     public function setHeader(string $field, string $value): Response {
-        if ($this->state & self::STARTED) {
-            throw new \Error(
-                "Cannot set header; output already started"
-            );
-        }
         assert($this->isValidHeaderField($field), "Invalid header field: {$field}");
         assert($this->isValidHeaderValue($value), "Invalid header value: {$value}");
         $this->headers[strtolower($field)] = [$value];
@@ -125,17 +122,15 @@ class StandardResponse implements Response {
     }
 
     /**
-     * {@inheritDoc}
-     * @throws \Error If output already started
+     * Provides an easy API to set cookie headers
+     * Those who prefer using addHeader() may do so.
+     *
+     * @param string $name
+     * @param string $value
+     * @param array $flags Shall be an array of key => value pairs and/or unkeyed values as per https://tools.ietf.org/html/rfc6265#section-5.2.1
      * @return self
      */
     public function setCookie(string $name, string $value, array $flags = []): Response {
-        if ($this->state & self::STARTED) {
-            throw new \Error(
-                "Cannot set header; output already started"
-            );
-        }
-
         // @TODO assert() valid $name / $value / $flags
         $this->cookies[$name] = [$value, $flags];
 
@@ -178,28 +173,6 @@ class StandardResponse implements Response {
             return $deferred->promise();
         }
         return $this->client->isDead & Client::CLOSED_WR ? new \Amp\Failure(new ClientException) : new \Amp\Success;
-    }
-
-    /**
-     * Request that any buffered data be flushed to the client.
-     *
-     * This method only makes sense when streaming output via Response::write().
-     * Invoking it before calling write() or after write()/end() is a logic error.
-     *
-     * @throws \Error If invoked before write() or after write()/end()
-     */
-    public function flush() {
-        if ($this->state & self::ENDED) {
-            throw new \Error(
-                "Cannot flush: response already sent"
-            );
-        } elseif ($this->state & self::STARTED) {
-            $this->codec->send(false);
-        } else {
-            throw new \Error(
-                "Cannot flush: response output not started"
-            );
-        }
     }
 
     /**
@@ -269,17 +242,13 @@ class StandardResponse implements Response {
     }
 
     /**
-     * {@inheritDoc}
-     * @throws \Error If output already started
+     * Indicate resources which a client likely needs to fetch. (e.g. Link: preload or HTTP/2 Server Push).
+     *
+     * @param string $url The URL this request should be dispatched to
+     * @param array $headers Optional custom headers, else the server will try to reuse headers from the last request
      * @return self
      */
     public function push(string $url, array $headers = null): Response {
-        if ($this->state & self::STARTED) {
-            throw new \Error(
-                "Cannot add push Promise; output already started"
-            );
-        }
-
         \assert((function ($headers) {
             foreach ($headers ?? [] as $name => $header) {
                 if (\is_int($name)) {
@@ -301,10 +270,14 @@ class StandardResponse implements Response {
     }
 
 
-    /**
-     * {@inheritDoc}
-     */
-    public function state(): int {
-        return $this->state;
+    public function getHeaders(): array {
+        if ($this->cookies) {
+            $this->setCookies();
+        }
+        return $this->headers;
+    }
+
+    public function getBody(): InputStream {
+        return $this->body;
     }
 }

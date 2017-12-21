@@ -2,9 +2,12 @@
 
 namespace Aerys;
 
+use Amp\Coroutine;
+use Amp\Promise;
 use Amp\Struct;
+use Amp\Success;
 
-class InternalRequest {
+class InternalRequest extends StandardRequest {
     use Struct;
 
     /** @var Client */
@@ -49,4 +52,20 @@ class InternalRequest {
     public $httpDate;
     /** @var array */
     public $locals = [];
+
+    public $middlewares = [];
+    public $middlewareIndex = 0;
+    public $responder;
+
+    public function submit(...$args): Promise {
+        $response = ($this->middlewares[$this->middlewareIndex++] ?? $this->responder)($this, ...$args);
+        if ($response instanceof \Generator) {
+            return new Coroutine($response);
+        }
+        if ($response instanceof Promise) {
+            return $response;
+        }
+        \assert($response instanceof Response);
+        return new Success($response);
+    }
 }

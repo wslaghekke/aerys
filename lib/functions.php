@@ -2,7 +2,10 @@
 
 namespace Aerys;
 
+use Amp\ByteStream\InMemoryStream;
+use Amp\ByteStream\IteratorStream;
 use Amp\InvalidYieldError;
+use Amp\Producer;
 use Psr\Log\LoggerInterface as PsrLogger;
 
 /**
@@ -157,179 +160,6 @@ function parseCookie(string $cookies): array {
 }
 
 /**
- * Filter response data.
- *
- * Is this function's cyclomatic complexity off the charts? Yes. Is this also an extremely
- * hot code path requiring maximum optimization? Yes. This is why it looks like the ninth
- * circle of npath hell ... #DealWithIt
- *
- * @param array $filters *ordered* filters array
- * @param \Aerys\InternalRequest $ireq
- * @return \Generator
- */
-function responseFilter(array $filters, InternalRequest $ireq): \Generator {
-    try {
-        $generators = [];
-        foreach ($filters as $key => $filter) {
-            $out = $filter($ireq);
-            if ($out instanceof \Generator && $out->valid()) {
-                $generators[$key] = $out;
-            }
-        }
-        $filters = $generators;
-
-        $isEnding = false;
-        $isFlushing = false;
-        $hadHeaders = -1;
-        $send = null;
-
-        do {
-            $toSend[] = $yielded = yield $send;
-            if ($yielded === null) {
-                $isEnding = true;
-                $isFlushing = true;
-            } elseif ($yielded === false) {
-                $isFlushing = true;
-            }
-
-            foreach ($filters as $key => $filter) {
-                $sendArray = $toSend;
-                $toSend = null;
-
-                do {
-                    $send = array_shift($sendArray);
-                    $yielded = $filter->send($send);
-                    if ($yielded === null || $yielded === false) {
-                        if ($filter->valid()) {
-                            if ($key > $hadHeaders) {
-                                if ($send === null) {
-                                    throw new InvalidYieldError(
-                                        $filter,
-                                        "Filter error; header array required from END (null) signal"
-                                    );
-                                } elseif ($send === false) {
-                                    throw new InvalidYieldError(
-                                        $filter,
-                                        "Filter error; header array required from FLUSH (false) signal"
-                                    );
-                                }
-                            }
-                        } else {
-                            unset($filters[$key]);
-                            $yielded = $filter->getReturn();
-
-                            if ($key > $hadHeaders) {
-                                if (\is_array($yielded)) {
-                                    assert(Internal\validateFilterHeaders($filter, $yielded) ?: 1);
-                                    $toSend[] = $yielded;
-                                    if ($sendArray) {
-                                        $toSend = array_merge($toSend, $sendArray);
-                                    }
-                                } elseif ($send === null || $send === false) {
-                                    $type = is_object($yielded) ? get_class($yielded) : gettype($yielded);
-                                    throw new InvalidYieldError(
-                                        $filter,
-                                        "Filter error; header array required but {$type} returned"
-                                    );
-                                } else {
-                                    // this is always an error because the two-stage filter
-                                    // process means any filter receiving non-header data
-                                    // must participate in both stages
-                                    throw new InvalidYieldError(
-                                        $filter,
-                                        "Filter error; cannot detach without yielding/returning headers"
-                                    );
-                                }
-                            } elseif (\is_string($yielded)) {
-                                if ($toSend && \is_string(\end($toSend))) {
-                                    $toSend[\key($toSend)] .= $yielded;
-                                } else {
-                                    $toSend[] = $yielded;
-                                }
-                            } elseif ($yielded !== null && $yielded !== false) {
-                                $type = is_object($yielded) ? get_class($yielded) : gettype($yielded);
-                                throw new InvalidYieldError(
-                                    $filter,
-                                    "Filter error; string entity data required but {$type} returned"
-                                );
-                            }
-
-                            \assert($key > $hadHeaders || $sendArray === [] || $sendArray === [null]);
-                            break;
-                        }
-                    } elseif (\is_string($yielded) && $key <= $hadHeaders) {
-                        if ($toSend && \is_string(\end($toSend))) {
-                            $toSend[\key($toSend)] .= $yielded;
-                        } else {
-                            $toSend[] = $yielded;
-                        }
-                    } elseif (\is_array($yielded) && $key > $hadHeaders) {
-                        assert(Internal\validateFilterHeaders($filter, $yielded) ?: 1);
-                        $toSend[] = $yielded;
-                        $hadHeaders = $key;
-                        if ($isEnding && !$sendArray) {
-                            $sendArray = [null];
-                        }
-                    } else {
-                        $type = is_object($yielded) ? get_class($yielded) : gettype($yielded);
-                        throw new InvalidYieldError(
-                            $filter,
-                            "Filter error; " . ($key > $hadHeaders ? "header array" : "string entity data") . " required but {$type} yielded"
-                        );
-                    }
-                } while ($sendArray);
-
-                if ($isFlushing) {
-                    $toSend[] = $isEnding ? null : false;
-                }
-                if ($toSend === null) {
-                    break;
-                }
-            }
-
-            $isFlushing = false;
-
-            if ($toSend) {
-                if (isset($toSend[1]) && $toSend[1] != "") {
-                    $sendArray = $toSend;
-                    $toSend = [];
-                    if (\is_array($sendArray[0])) {
-                        $send = array_shift($sendArray);
-
-                        $toSend = [$yielded = yield $send];
-                        if ($yielded === null) {
-                            $isEnding = true;
-                            $isFlushing = true;
-                        } elseif ($yielded === false) {
-                            $isFlushing = true;
-                        }
-                    }
-
-                    $send = implode($sendArray);
-                } else {
-                    $send = $toSend[0];
-                    $toSend = [];
-                }
-                if ($send === "") {
-                    $send = null;
-                }
-            } else {
-                $send = null;
-                $toSend = [];
-            }
-        } while (!$isEnding);
-
-        return $send;
-    } catch (ClientException $uncaught) {
-        throw $uncaught;
-    } catch (\Throwable $uncaught) {
-        $ireq->filterErrorFlag = true;
-        $ireq->badFilterKeys[] = $key;
-        throw new FilterException("Filter error", 0, $uncaught);
-    }
-}
-
-/**
  * Manages a filter and pipes its yielded values to the InternalRequest->responseWriter.
  * @param $filter \Generator a filter manager (like generated by responseFilter)
  */
@@ -374,7 +204,7 @@ function responseCodec(\Generator $filter, InternalRequest $ireq): \Generator {
  * @param \Aerys\InternalRequest $ireq
  * @return \Generator
  */
-function deflateResponseFilter(InternalRequest $ireq): \Generator {
+function deflateResponseFilter(InternalRequest $ireq, ...$args): \Generator {
     if (empty($ireq->headers["accept-encoding"])) {
         return;
     }
@@ -391,11 +221,12 @@ function deflateResponseFilter(InternalRequest $ireq): \Generator {
         return;
     } while (0);
 
-    $headers = yield;
+    $response = yield $ireq->submit(...$args);
+    $headers = $response->getHeaders();
 
     // We can't deflate if we don't know the content-type
     if (empty($headers["content-type"])) {
-        return $headers;
+        return $response;
     }
 
     $options = $ireq->client->options;
@@ -403,7 +234,7 @@ function deflateResponseFilter(InternalRequest $ireq): \Generator {
     // Match and cache Content-Type
     if (!$doDeflate = $options->_dynamicCache->deflateContentTypes[$headers["content-type"][0]] ?? null) {
         if ($doDeflate === 0) {
-            return $headers;
+            return $response;
         }
 
         if (count($options->_dynamicCache->deflateContentTypes) == Options::MAX_DEFLATE_ENABLE_CACHE_SIZE) {
@@ -415,13 +246,16 @@ function deflateResponseFilter(InternalRequest $ireq): \Generator {
         $options->_dynamicCache->deflateContentTypes[$contentType] = $doDeflate;
 
         if ($doDeflate === 0) {
-            return $headers;
+            return $response;
         }
     }
 
     $minBodySize = $options->deflateMinimumLength;
     $contentLength = $headers["content-length"][0] ?? null;
     $bodyBuffer = "";
+
+    // @TODO We have the ability to support DEFLATE and RAW encoding as well. Should we?
+    $mode = \ZLIB_ENCODING_GZIP;
 
     if (!isset($contentLength)) {
         // Wait until we know there's enough stream data to compress before proceeding.
@@ -434,13 +268,52 @@ function deflateResponseFilter(InternalRequest $ireq): \Generator {
                 return $bodyBuffer;
             }
         } while (!isset($bodyBuffer[$minBodySize]));
+        $body = $response->getBody();
+        $bodyBuffer = false;
+        $body->read()->onResolve(function ($e, $data) use (&$bodyBuffer, &$ex) {
+            $bodyBuffer = $data;
+            $ex = $e;
+        });
+        if ($bodyBuffer !== false) {
+            if ($bodyBuffer === null) {
+                if ($ex) {
+                    throw $ex;
+                }
+                return $response;
+            }
+
+            $readPromise = $body->read();
+            $readPromise->onResolve(function ($e, $data) use (&$ex, &$end) {
+                if ($data === null) {
+                    $ex = $e;
+                    $end = true;
+                }
+            });
+            if ($end) {
+                if ($ex) {
+                    throw $e;
+                }
+                if (\strlen($bodyBuffer) < $minBodySize) {
+                    unset($headers["content-length"]);
+                    if ($ireq->protocol === "1.1") {
+                        $headers["transfer-encoding"] = ["chunked"];
+                    } else {
+                        $headers["connection"] = ["close"];
+                    }
+                    $headers["content-encoding"] = ["gzip"];
+                    $bodyBuffer = gzcompress($bodyBuffer, -1, $mode);
+                }
+                return new StandardResponse($headers, new InMemoryStream($bodyBuffer));
+            }
+        }
     } elseif (empty($contentLength) || $contentLength < $minBodySize) {
         // If the Content-Length is too small we can't compress it.
-        return $headers;
+        return $response;
+    } else {
+        $body = $response->getBody();
+        $readPromise = $body->read();
     }
 
-    // @TODO We have the ability to support DEFLATE and RAW encoding as well. Should we?
-    $mode = \ZLIB_ENCODING_GZIP;
     if (($resource = \deflate_init($mode)) === false) {
         throw new \RuntimeException(
             "Failed initializing deflate context"
@@ -457,39 +330,35 @@ function deflateResponseFilter(InternalRequest $ireq): \Generator {
         $headers["connection"] = ["close"];
     }
     $headers["content-encoding"] = ["gzip"];
-    $minFlushOffset = $options->deflateBufferSize;
-    $deflated = $headers;
 
-    while (($uncompressed = yield $deflated) !== null) {
-        $bodyBuffer .= $uncompressed;
-        if ($uncompressed === false) {
-            if ($bodyBuffer === "") {
-                $deflated = null;
-            } elseif (($deflated = \deflate_add($resource, $bodyBuffer, \ZLIB_SYNC_FLUSH)) === false) {
-                throw new \RuntimeException(
-                    "Failed adding data to deflate context"
-                );
-            } else {
-                $bodyBuffer = "";
+    $minFlushOffset = $options->deflateBufferSize;
+    $producer = new Producer(function ($emit) use ($bodyBuffer, $body, $readPromise, $resource, $minFlushOffset) {
+        while (null !== $uncompressed = yield $readPromise) {
+            $bodyBuffer .= $uncompressed;
+            if (isset($bodyBuffer[$minFlushOffset])) {
+                if (($deflated = \deflate_add($resource, $bodyBuffer)) === false) {
+                    throw new \RuntimeException(
+                        "Failed adding data to deflate context"
+                    );
+                } else {
+                    $emit($deflated);
+                    $bodyBuffer = "";
+                }
             }
-        } elseif (!isset($bodyBuffer[$minFlushOffset])) {
-            $deflated = null;
-        } elseif (($deflated = \deflate_add($resource, $bodyBuffer)) === false) {
+            $resource = $body->read();
+        }
+
+        if (($deflated = \deflate_add($resource, $bodyBuffer, \ZLIB_FINISH)) === false) {
             throw new \RuntimeException(
                 "Failed adding data to deflate context"
             );
-        } else {
-            $bodyBuffer = "";
         }
-    }
 
-    if (($deflated = \deflate_add($resource, $bodyBuffer, \ZLIB_FINISH)) === false) {
-        throw new \RuntimeException(
-            "Failed adding data to deflate context"
-        );
-    }
+        return $deflated;
+    });
 
-    return $deflated;
+    return new StandardResponse($headers, new IteratorStream($producer));
+
 }
 
 /**
@@ -499,10 +368,8 @@ function deflateResponseFilter(InternalRequest $ireq): \Generator {
  * @return \Generator
  */
 function nullBodyResponseFilter(InternalRequest $ireq): \Generator {
-    // Receive headers and defer send them back.
-    yield yield;
-    // Yield null (need more data) for all subsequent body data
-    while (yield !== null);
+    $response = yield $ireq->submit();
+    return new StandardResponse($response->getHeaders());
 }
 
 /**

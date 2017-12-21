@@ -5,84 +5,84 @@ namespace Aerys;
 use Amp\ByteStream\IteratorStream;
 use Amp\ByteStream\Message;
 
-class StandardRequest implements Request {
-    private $internalRequest;
+abstract class StandardRequest implements Request {
+    protected $method;
+    protected $uri;
+    protected $protocol;
+    protected $headers;
+    protected $maxBodySize;
+    protected $client;
+    protected $body;
+    protected $streamId;
+    protected $locals;
+    
     private $queryParams;
-    private $body;
-
-    /**
-     * @param \Aerys\InternalRequest $internalRequest
-     */
-    public function __construct(InternalRequest $internalRequest) {
-        $this->internalRequest = $internalRequest;
-    }
+    private $currentBody;
 
     /**
      * {@inheritdoc}
      */
     public function getMethod(): string {
-        return $this->internalRequest->method;
+        return $this->method;
     }
 
     /**
      * {@inheritdoc}
      */
     public function getUri(): string {
-        return $this->internalRequest->uri;
+        return $this->uri;
     }
 
     /**
      * {@inheritdoc}
      */
     public function getProtocolVersion(): string {
-        return $this->internalRequest->protocol;
+        return $this->protocol;
     }
 
     /**
      * {@inheritdoc}
      */
     public function getHeader(string $field) {
-        return $this->internalRequest->headers[strtolower($field)][0] ?? null;
+        return $this->headers[strtolower($field)][0] ?? null;
     }
 
     /**
      * {@inheritdoc}
      */
     public function getHeaderArray(string $field): array {
-        return $this->internalRequest->headers[strtolower($field)] ?? [];
+        return $this->headers[strtolower($field)] ?? [];
     }
 
     /**
      * {@inheritdoc}
      */
     public function getAllHeaders(): array {
-        return $this->internalRequest->headers;
+        return $this->headers;
     }
 
     /**
      * {@inheritdoc}
      */
     public function getBody(int $bodySize = -1): Message {
-        $ireq = $this->internalRequest;
         if ($bodySize > -1) {
-            if ($bodySize > ($ireq->maxBodySize ?? $ireq->client->options->maxBodySize)) {
-                $ireq->maxBodySize = $bodySize;
-                $ireq->client->httpDriver->upgradeBodySize($this->internalRequest);
+            if ($bodySize > ($this->maxBodySize ?? $this->client->options->maxBodySize)) {
+                $this->maxBodySize = $bodySize;
+                $this->client->httpDriver->upgradeBodySize($this->internalRequest);
             }
         }
 
-        if ($ireq->body != $this->body) {
-            $this->body = $ireq->body;
-            $ireq->body->onResolve(function ($e, $data) {
+        if ($this->body != $this->currentBody) {
+            $this->currentBody = $this->body;
+            $this->body->onResolve(function ($e, $data) {
                 if ($e instanceof ClientSizeException) {
-                    $ireq = $this->internalRequest;
-                    $bodyEmitter = $ireq->client->bodyEmitters[$ireq->streamId];
-                    $ireq->body = new Message(new IteratorStream($bodyEmitter->iterate()));
+                    $bodyEmitter = $this->client->bodyEmitters[$this->streamId];
+                    $this->body = new Message(new IteratorStream($bodyEmitter->iterate()));
                     $bodyEmitter->emit($data);
                 }
             });
         }
-        return $ireq->body;
+        return $this->body;
     }
 
     /**
@@ -107,12 +107,12 @@ class StandardRequest implements Request {
     }
 
     private function parseParams() {
-        if (empty($this->internalRequest->uriQuery)) {
+        if (empty($this->uriQuery)) {
             return $this->queryParams = [];
         }
 
-        $pairs = explode("&", $this->internalRequest->uriQuery);
-        if (count($pairs) > $this->internalRequest->client->options->maxInputVars) {
+        $pairs = explode("&", $this->uriQuery);
+        if (count($pairs) > $this->client->options->maxInputVars) {
             throw new ClientSizeException;
         }
 
@@ -130,30 +130,28 @@ class StandardRequest implements Request {
      * {@inheritdoc}
      */
     public function getCookie(string $name) {
-        $ireq = $this->internalRequest;
-
-        return $ireq->cookies[$name] ?? null;
+        return $this->cookies[$name] ?? null;
     }
 
     /**
      * {@inheritdoc}
      */
     public function getLocalVar(string $key) {
-        return $this->internalRequest->locals[$key] ?? null;
+        return $this->locals[$key] ?? null;
     }
 
     /**
      * {@inheritdoc}
      */
     public function setLocalVar(string $key, $value) {
-        $this->internalRequest->locals[$key] = $value;
+        $this->locals[$key] = $value;
     }
 
     /**
      * {@inheritdoc}
      */
     public function getConnectionInfo(): array {
-        $client = $this->internalRequest->client;
+        $client = $this->client;
         return [
             "client_port" => $client->clientPort,
             "client_addr" => $client->clientAddr,
@@ -168,6 +166,6 @@ class StandardRequest implements Request {
      * {@inheritdoc}
      */
     public function getOption(string $option) {
-        return $this->internalRequest->client->options->{$option};
+        return $this->client->options->{$option};
     }
 }

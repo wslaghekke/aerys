@@ -2,8 +2,11 @@
 
 namespace Aerys;
 
+use Amp\ByteStream\InMemoryStream;
+use Amp\ByteStream\IteratorStream;
 use Amp\Deferred;
 use Amp\Loop;
+use Amp\Producer;
 
 class Http1Driver implements HttpDriver {
     const HEADER_REGEX = "(
@@ -547,7 +550,9 @@ class Http1Driver implements HttpDriver {
     }
 
     public static function responseInitFilter(InternalRequest $ireq) {
-        $headers = yield;
+        $response = yield $ireq->submit();
+        $headers = $response->getHeaders();
+        $body = $response->getBody();
         $status = $headers[":status"];
         $options = $ireq->client->options;
 
@@ -565,28 +570,44 @@ class Http1Driver implements HttpDriver {
         $contentLength = $headers[":aerys-entity-length"];
         unset($headers[":aerys-entity-length"]);
 
-        if ($contentLength === "@") {
-            $hasContent = false;
-            $shouldClose = $ireq->protocol === "1.0";
+        $shouldClose = $ireq->protocol === "1.0";
+
+        $firstChunkPromise = $body->read();
+        $firstChunk = false;
+        $firstChunkPromise->onResolve(function ($e, $data) use (&$firstChunk) {
+            if (!$e) {
+                $firstChunk = $data;
+            }
+        });
+        if ($firstChunk === null) {
             if (($status >= 200 && $status != 204 && $status != 304)) {
                 $headers["content-length"] = ["0"];
             }
-        } elseif ($contentLength !== "*") {
-            $hasContent = true;
-            $shouldClose = $ireq->protocol === "1.0";
-            $headers["content-length"] = [$contentLength];
-            unset($headers["transfer-encoding"]);
-        } elseif ($ireq->protocol === "1.1") {
-            $hasContent = true;
-            $shouldClose = false;
-            $headers["transfer-encoding"] = ["chunked"];
-            unset($headers["content-length"]);
         } else {
-            $hasContent = true;
-            $shouldClose = true;
-        }
+            $secondChunk = false;
+            if ($firstChunk !== false) {
+                $secondChunkPromise = $body->read();
+                $secondChunk = false;
+                $secondChunkPromise->onResolve(function ($e, $data) use (&$secondChunk) {
+                    if (!$e) {
+                        $secondChunk = $data;
+                    }
+                });
+            }
+            if ($secondChunk === null) {
+                $headers["content-length"] = [\strlen($contentLength)];
+                unset($headers["transfer-encoding"]);
 
-        if ($hasContent) {
+                $body = $firstChunk;
+            } else {
+                $body = new PrefixStream($firstChunk === false ? [$firstChunkPromise] : [$firstChunk, $secondChunkPromise], $body);
+
+                if (!$shouldClose) {
+                    $headers["transfer-encoding"] = ["chunked"];
+                    unset($headers["content-length"]);
+                }
+            }
+
             $type = $headers["content-type"][0] ?? $options->defaultContentType;
             if (\stripos($type, "text/") === 0 && \stripos($type, "charset=") === false) {
                 $type .= "; charset={$options->defaultTextCharset}";
@@ -607,7 +628,7 @@ class Http1Driver implements HttpDriver {
 
         $headers["date"] = [$ireq->httpDate];
 
-        return $headers;
+        return new StandardResponse($headers, $body);
     }
 
     /**
@@ -617,33 +638,30 @@ class Http1Driver implements HttpDriver {
      * @return \Generator
      */
     public static function chunkedResponseFilter(InternalRequest $ireq): \Generator {
-        $headers = yield;
+        $response = yield $ireq->submit();
+        $headers = $response->getHeaders();
 
         if (empty($headers["transfer-encoding"])) {
-            return $headers;
+            return $response;
         }
         if (!\in_array("chunked", $headers["transfer-encoding"])) {
-            return $headers;
+            return $response;
         }
 
-        $bodyBuffer = "";
-        $bufferSize = $ireq->client->options->chunkBufferSize ?? 8192;
-        $unchunked = yield $headers;
+        $body = $response->getBody();
+        return new StandardResponse($headers, new IteratorStream(new Producer(function($emit) use ($body) {
+            $bodyBuffer = "";
+            $bufferSize = $ireq->client->options->chunkBufferSize ?? 8192;
 
-        do {
-            $bodyBuffer .= $unchunked;
-            if (isset($bodyBuffer[$bufferSize]) || ($unchunked === false && $bodyBuffer != "")) {
-                $chunk = \dechex(\strlen($bodyBuffer)) . "\r\n{$bodyBuffer}\r\n";
-                $bodyBuffer = "";
-            } else {
-                $chunk = null;
+            while (null !== $chunk = yield $body->read()) {
+                $bodyBuffer .= $chunk;
+                if (isset($bodyBuffer[$bufferSize])) {
+                    yield $emit(\dechex(\strlen($bodyBuffer)) . "\r\n{$bodyBuffer}\r\n");
+                    $bodyBuffer = "";
+                }
             }
-        } while (($unchunked = yield $chunk) !== null);
 
-        $chunk = ($bodyBuffer != "")
-            ? (\dechex(\strlen($bodyBuffer)) . "\r\n{$bodyBuffer}\r\n0\r\n\r\n")
-            : "0\r\n\r\n";
-
-        return $chunk;
+            $emit(($bodyBuffer != "" ? \dechex(\strlen($bodyBuffer)) . "\r\n{$bodyBuffer}\r\n" : "") . "0\r\n\r\n");
+        })));
     }
 }
